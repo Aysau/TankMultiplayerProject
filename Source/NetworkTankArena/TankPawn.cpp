@@ -17,8 +17,8 @@ ATankPawn::ATankPawn()
 	PrimaryActorTick.TickGroup = TG_PrePhysics;
 	bReplicates = true;
 	SetReplicatingMovement(true);
-	SetNetUpdateFrequency(20.f);
-	SetMinNetUpdateFrequency(20.f);
+	SetNetUpdateFrequency(60.f);
+	SetMinNetUpdateFrequency(30.f);
 	AutoPossessAI = EAutoPossessAI::Disabled;
 	AutoPossessPlayer = EAutoReceiveInput::Disabled;
 	bUseControllerRotationPitch = false;
@@ -102,6 +102,8 @@ void ATankPawn::BeginPlay()
 	TurretYawPivot->SetRelativeRotation(FRotator::ZeroRotator);
 	BaseVisualTransform = VisualRoot->GetRelativeTransform();
 	BaseChassisTransform = ChassisVisualPivot->GetRelativeTransform();
+	PredictedTurretWorldYaw = CanonicalTurretWorldYaw;
+	RemoteSmoothedTurretYaw = CanonicalTurretWorldYaw;
 	TankMovement->SetUpdatedComponent(CollisionRoot);
 	TankMovement->InitializeGameplayPlane();
 	PreviousPresentationYaw = NormalizeYaw(GetActorRotation().Yaw);
@@ -111,7 +113,7 @@ void ATankPawn::BeginPlay()
 
 void ATankPawn::SubmitControlIntent(const FTankControlIntent& Intent)
 {
-	if (!HasAuthority())
+	if (!HasAuthority() && !IsLocallyControlled())
 	{
 		return;
 	}
@@ -136,6 +138,7 @@ void ATankPawn::Tick(float DeltaTime)
 	Super::Tick(DeltaTime);
 	if (HasAuthority())
 	{
+		// Enforce authoritative heartbeat timeout
 		if (NetworkTankArena::LocalTank::IsValidDeltaTime(DeltaTime))
 		{
 			ControlIntentAgeSeconds += DeltaTime;
@@ -144,13 +147,19 @@ void ATankPawn::Tick(float DeltaTime)
 				ClearControlIntent();
 			}
 		}
-		TankMovement->SimulateMovement(CurrentIntent, DeltaTime);
-		if (NetworkTankArena::LocalTank::IsValidDeltaTime(DeltaTime))
+
+		// Only simulate in Tick if this tank is locally controlled on the server
+		if (!bIsRemoteControlled)
 		{
-			CanonicalTurretWorldYaw = NetworkTankArena::LocalTank::ResolveTurretWorldYaw(
-				CanonicalTurretWorldYaw, GetActorLocation(), CurrentIntent);
+			TankMovement->SimulateMovement(CurrentIntent, DeltaTime);
+			if (NetworkTankArena::LocalTank::IsValidDeltaTime(DeltaTime))
+			{
+				CanonicalTurretWorldYaw = NetworkTankArena::LocalTank::ResolveTurretWorldYaw(
+					CanonicalTurretWorldYaw, GetActorLocation(), CurrentIntent);
+			}
 		}
 	}
+
 	ApplyPresentation(DeltaTime);
 }
 
@@ -172,11 +181,9 @@ void ATankPawn::OnRep_CanonicalTurretWorldYaw()
 void ATankPawn::PossessedBy(AController* NewController)
 {
 	Super::PossessedBy(NewController);
-	// APawn normally promotes a remote player's pawn to an autonomous proxy.
-	// FRepMovement skips autonomous proxies. With no prediction, ALL client tanks
-	// must be simulated proxies, including the owned tank. Ownership still belongs
-	// to the controller; its Server RPC carries intent for its possessed pawn.
-	SetAutonomousProxy(false);
+	// Allow remote owning clients to be Autonomous Proxies so they can predict movement locally.
+	// Remote observers will still remain Simulated Proxies.
+	SetAutonomousProxy(true);
 	ClearControlIntent();
 }
 
@@ -193,20 +200,28 @@ void ATankPawn::ApplyPresentation(float DeltaTime)
 	if (IsValidDeltaTime(DeltaTime))
 	{
 		HoverPhase = FMath::Fmod(HoverPhase + 2.0 * UE_PI * NonNegativeFinite(HoverFrequencyHz) * DeltaTime, 2.0 * UE_PI);
-		// Derive local banking from observed chassis motion on every machine. No intent
-		// or cosmetic transforms need replication; stepped client motion is intentional.
 		const float TurnRate = NonNegativeFinite(TankMovement->GetTurnRateDegreesPerSecond());
 		const float ObservedTurn = TurnRate > UE_SMALL_NUMBER
 			? SanitizeAxis(FMath::FindDeltaAngleDegrees(PreviousPresentationYaw, GetActorRotation().Yaw) / (DeltaTime * TurnRate)) : 0.f;
 		const float TargetBank = -ObservedTurn * FMath::Min(NonNegativeFinite(MaxBankDegrees), 15.f);
 		CurrentBankDegrees = FMath::FInterpTo(CurrentBankDegrees, TargetBank, DeltaTime, NonNegativeFinite(BankInterpSpeed));
 		PreviousPresentationYaw = NormalizeYaw(GetActorRotation().Yaw);
+
+		VisualCorrectionOffset = FMath::VInterpTo(VisualCorrectionOffset, FVector::ZeroVector, DeltaTime, VisualSmoothingInterpSpeed);
+
+		if (!IsLocallyControlled())
+		{
+			RemoteSmoothedTurretYaw = FMath::FInterpTo(RemoteSmoothedTurretYaw, CanonicalTurretWorldYaw, DeltaTime, 15.f);
+		}
 	}
+
 	const double Bob = FMath::Sin(HoverPhase) * NonNegativeFinite(HoverAmplitude);
-	VisualRoot->SetRelativeLocation(BaseVisualTransform.GetLocation() + FVector(0.0, 0.0, Bob));
+	VisualRoot->SetRelativeLocation(BaseVisualTransform.GetLocation() + FVector(0.0, 0.0, Bob) + VisualCorrectionOffset);
 	ChassisVisualPivot->SetRelativeRotation(BaseChassisTransform.Rotator() + FRotator(0.0, 0.0, CurrentBankDegrees));
+
+	const float ActiveTurretYaw = IsLocallyControlled() ? PredictedTurretWorldYaw : RemoteSmoothedTurretYaw;
 	TurretYawPivot->SetRelativeRotation(FRotator(0.0,
-		CalculateRelativeTurretYaw(GetActorRotation().Yaw, CanonicalTurretWorldYaw), 0.0));
+		CalculateRelativeTurretYaw(GetActorRotation().Yaw, ActiveTurretYaw), 0.0));
 }
 
 void ATankPawn::UpdateControllerTickPrerequisite()
@@ -239,4 +254,134 @@ void ATankPawn::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	}
 	TickController.Reset();
 	Super::EndPlay(EndPlayReason);
+}
+
+void ATankPawn::ExecuteAuthoritativeMove(float DeltaTime, const FTankControlIntent& Intent)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	bIsRemoteControlled = true;
+
+	SubmitControlIntent(Intent);
+	TankMovement->SimulateMovement(CurrentIntent, DeltaTime);
+
+	if (NetworkTankArena::LocalTank::IsValidDeltaTime(DeltaTime))
+	{
+		CanonicalTurretWorldYaw = NetworkTankArena::LocalTank::ResolveTurretWorldYaw(
+			CanonicalTurretWorldYaw, GetActorLocation(), CurrentIntent);
+	}
+}
+
+void ATankPawn::PredictLocalMove(uint32 Sequence, float DeltaTime, const FTankControlIntent& Intent)
+{
+	if (!IsLocallyControlled() || HasAuthority())
+	{
+		return;
+	}
+
+	CurrentIntent = NetworkTankArena::LocalTank::SanitizeIntent(Intent);
+
+	// Simulate the movement locally
+	TankMovement->SimulateMovement(CurrentIntent, DeltaTime);
+
+	// Predict local turret yaw
+	if (NetworkTankArena::LocalTank::IsValidDeltaTime(DeltaTime))
+	{
+		PredictedTurretWorldYaw = NetworkTankArena::LocalTank::ResolveTurretWorldYaw(
+			PredictedTurretWorldYaw, GetActorLocation(), CurrentIntent);
+	}
+
+	// Record move in the prediction buffer
+	FTankMoveRecord Record;
+	Record.Sequence = Sequence;
+	Record.DeltaTime = DeltaTime;
+	Record.Intent = CurrentIntent;
+	Record.ResultLocation = GetActorLocation();
+	Record.ResultRotation = GetActorRotation();
+
+	SavedMoves.Add(Record);
+
+	// Safety cap to prevent memory costs if connection drops
+	if (SavedMoves.Num() > MaxSavedMovesCapacity)
+	{
+		SavedMoves.RemoveAt(0, SavedMoves.Num() - MaxSavedMovesCapacity);
+	}
+}
+
+void ATankPawn::ReconcileServerMove(const FTankServerMoveAck& Ack)
+{
+	if (!IsLocallyControlled() || HasAuthority())
+	{
+		return;
+	}
+
+	// Discard all moves acknowledged up to AckSequence
+	int32 AckIndex = INDEX_NONE;
+	for (int32 i = 0; i < SavedMoves.Num(); ++i)
+	{
+		if (SavedMoves[i].Sequence == Ack.AckSequence)
+		{
+			AckIndex = i;
+			break;
+		}
+		if (SavedMoves[i].Sequence > Ack.AckSequence)
+		{
+			// The acked move was dropped or already discarded
+			break;
+		}
+	}
+
+	if (AckIndex == INDEX_NONE)
+	{
+		// Move already cleared or out of sequence
+		return;
+	}
+
+	const FTankMoveRecord& AckedMove = SavedMoves[AckIndex];
+
+	// Calculate error between client predicted result and server authoritative truth
+	const float PositionError = FVector::Dist(AckedMove.ResultLocation, Ack.Location);
+	const float YawError = FMath::Abs(FMath::FindDeltaAngleDegrees(AckedMove.ResultRotation.Yaw, Ack.Rotation.Yaw));
+
+	if (PositionError > MaxReconciliationError)
+	{
+		MaxReconciliationError = PositionError;
+	}
+
+	const bool bRequiresReconciliation = (PositionError > PositionCorrectionThreshold) || (YawError > YawCorrectionThreshold);
+
+	if (bRequiresReconciliation)
+	{
+		ReconciliationCount++;
+		UE_LOG(LogTemp, Verbose, TEXT("[Prediction] Reconciliation #%d! PosError: %.2f cm, YawError: %.2f deg"),
+			ReconciliationCount, PositionError, YawError);
+
+		// Record the client's position at the current time before correction
+		const FVector PreCorrectionLocation = GetActorLocation();
+
+		// Rewind physics state to server truth
+		SetActorLocation(Ack.Location, false, nullptr, ETeleportType::TeleportPhysics);
+		SetActorRotation(Ack.Rotation, ETeleportType::TeleportPhysics);
+		TankMovement->Velocity = Ack.Velocity;
+
+		// Replay all remaining unacknowledged moves forward to current time
+		for (int32 i = AckIndex + 1; i < SavedMoves.Num(); ++i)
+		{
+			FTankMoveRecord& PendingMove = SavedMoves[i];
+			TankMovement->SimulateMovement(PendingMove.Intent, PendingMove.DeltaTime);
+			PendingMove.ResultLocation = GetActorLocation();
+			PendingMove.ResultRotation = GetActorRotation();
+		}
+
+		// The true visual offset is the difference between old prediction and new replayed position!
+		const FVector PostReplayLocation = GetActorLocation();
+		VisualCorrectionOffset = (PreCorrectionLocation - PostReplayLocation);
+		VisualCorrectionOffset = VisualCorrectionOffset.GetClampedToMaxSize(30.f);
+	}
+
+	// Remove all moves through AckIndex from the buffer
+	SavedMoves.RemoveAt(0, AckIndex + 1);
 }

@@ -53,8 +53,9 @@ private:
 	friend class FTankNetworkFireLifecycleTest;
 
 	UFUNCTION(Server, Unreliable)
-	void ServerSubmitControlIntent(ATankPawn* TargetTank, uint32 Sequence, FTankControlIntent Intent);
+	void ServerSubmitMove(ATankPawn* TargetTank, uint32 Sequence, float DeltaTime, FTankControlIntent Intent);
 	void SubmitLocalControlIntent(ATankPawn* Tank, const FTankControlIntent& Intent);
+	void ServerSubmitControlIntent_Implementation(ATankPawn* TargetTank, uint32 Sequence, FTankControlIntent Intent);
 	void AcceptControlIntent(ATankPawn* TargetTank, uint32 Sequence, const FTankControlIntent& Intent);
 
 	UFUNCTION(Server, Reliable)
@@ -62,6 +63,10 @@ private:
 	void SubmitLocalFireRequest(ATankPawn* Tank, const FVector& AimWorldPoint);
 	void AcceptFireRequest(ATankPawn* FiringTank, const FTankFireRequest& Request);
 	void DispatchPendingFire(const FTankControlIntent& Intent);
+
+	// Client RPC: Server sends back authoritative confirmation
+	UFUNCTION(Client, Unreliable)
+	void ClientAckMove(ATankPawn* TargetTank, FTankServerMoveAck Ack);
 
 	void UpdateThrottle(const FInputActionValue& Value);
 	void UpdateTurn(const FInputActionValue& Value);

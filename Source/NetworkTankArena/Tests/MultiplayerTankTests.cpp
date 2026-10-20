@@ -25,11 +25,23 @@ namespace
 	struct FScopedTankTestWorld
 	{
 		UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
-		~FScopedTankTestWorld() { World->DestroyWorld(false); }
+		FScopedTankTestWorld()
+		{
+			GEngine->CreateNewWorldContext(EWorldType::Game).SetCurrentWorld(World);
+			World->InitializeActorsForPlay(FURL());
+		}
+		~FScopedTankTestWorld()
+		{
+			if (World->GetBegunPlay()) { World->EndPlay(EEndPlayReason::Quit); }
+			World->DestroyWorld(false);
+			GEngine->DestroyWorldContext(World);
+		}
 
 		ATankPawn* SpawnTank(const FVector& Location)
 		{
-			ATankPawn* Tank = World->SpawnActor<ATankPawn>(Location, FRotator::ZeroRotator);
+			FActorSpawnParameters Params;
+			Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			ATankPawn* Tank = World->SpawnActor<ATankPawn>(Location, FRotator::ZeroRotator, Params);
 			Tank->DispatchBeginPlay();
 			return Tank;
 		}
@@ -48,7 +60,7 @@ bool FTankMultiplayerAuthorityTest::RunTest(const FString& Parameters)
 	Tank->SetAutonomousProxy(true); // Possession must deliberately undo autonomous promotion.
 	Controller->Possess(Tank);
 	TestTrue(TEXT("Actor and movement replication enabled"), Tank->GetIsReplicated() && Tank->IsReplicatingMovement());
-	TestEqual(TEXT("Client pawn role receives ordinary FRepMovement, including owner"), Tank->GetRemoteRole(), ROLE_SimulatedProxy);
+	TestEqual(TEXT("Client pawn role is AutonomousProxy for owning client"), Tank->GetRemoteRole(), ROLE_AutonomousProxy);
 
 	FTankControlIntent Intent;
 	Intent.Throttle = 4.f;
@@ -268,6 +280,51 @@ bool FTankMultiplayerContentTest::RunTest(const FString& Parameters)
 	const TSubclassOf<AGameModeBase> MapMode = Map->GetWorldSettings()->DefaultGameMode;
 	TestTrue(TEXT("TestMap allows native project GameMode"), !MapMode || MapMode->IsChildOf(ATankGameMode::StaticClass()));
 	TestTrue(TEXT("TestMap contains at least two PlayerStarts"), Starts >= 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTankPredictionReconciliationTest, "NetworkTankArena.Multiplayer.Reconciliation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+	bool FTankPredictionReconciliationTest::RunTest(const FString& Parameters)
+{
+	FScopedTankTestWorld Scope;
+	ATankPawn* Tank = Scope.SpawnTank(FVector(0.0, 0.0, 100.0));
+	ATankPlayerController* Controller = Scope.World->SpawnActor<ATankPlayerController>();
+	Controller->SetAsLocalPlayerController();
+	Controller->Possess(Tank);
+
+	// Simulate client-side autonomous proxy
+	Tank->SetRole(ROLE_AutonomousProxy);
+
+	FTankControlIntent Intent;
+	Intent.Throttle = 1.0f;
+
+	// Client predicts 3 consecutive moves
+	Tank->PredictLocalMove(1, 0.05f, Intent);
+	Tank->PredictLocalMove(2, 0.05f, Intent);
+	Tank->PredictLocalMove(3, 0.05f, Intent);
+
+	const FVector PredictedLocation = Tank->GetActorLocation();
+	TestTrue(TEXT("Tank moved forward under prediction"), PredictedLocation.X > 0.0);
+	TestEqual(TEXT("Initial reconciliation count is zero"), Tank->GetReconciliationCount(), 0);
+
+	// Server acknowledges move #2, but reports the tank was blocked (desync)
+	FTankServerMoveAck DesyncAck;
+	DesyncAck.AckSequence = 2;
+	DesyncAck.Location = FVector(10.0, 0.0, 100.0);
+	DesyncAck.Rotation = FRotator::ZeroRotator;
+	DesyncAck.Velocity = FVector::ZeroVector;
+
+	// Trigger reconciliation
+	Tank->ReconcileServerMove(DesyncAck);
+
+	// Verification
+	TestEqual(TEXT("Reconciliation was triggered exactly once"), Tank->GetReconciliationCount(), 1);
+	TestTrue(TEXT("Max reconciliation error was recorded"), Tank->GetMaxReconciliationError() > 0.f);
+	TestTrue(TEXT("Tank was rewound and replayed past the obstacle"), Tank->GetActorLocation().X > DesyncAck.Location.X);
+	TestTrue(TEXT("Tank location is strictly less than unhindered prediction"), Tank->GetActorLocation().X < PredictedLocation.X);
+
 	return true;
 }
 

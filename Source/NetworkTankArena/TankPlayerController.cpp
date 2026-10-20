@@ -14,6 +14,7 @@
 #include "TankPawn.h"
 #include "TankWeaponComponent.h"
 #include "UnrealClient.h"
+#include "TankMovementComponent.h"
 
 void ATankPlayerController::BeginPlay()
 {
@@ -56,6 +57,14 @@ void ATankPlayerController::SetupInputComponent()
 		EnhancedInput->BindAction(FireAction, ETriggerEvent::Started, this, &ATankPlayerController::HandleFireStarted);
 		EnhancedInput->BindAction(FireAction, ETriggerEvent::Completed, this, &ATankPlayerController::HandleFireCompleted);
 		EnhancedInput->BindAction(FireAction, ETriggerEvent::Canceled, this, &ATankPlayerController::HandleFireCanceled);
+	}
+}
+
+void ATankPlayerController::ClientAckMove_Implementation(ATankPawn* TargetTank, FTankServerMoveAck Ack)
+{
+	if (IsValid(TargetTank) && TargetTank->IsLocallyControlled())
+	{
+		TargetTank->ReconcileServerMove(Ack);
 	}
 }
 
@@ -148,19 +157,32 @@ void ATankPlayerController::PlayerTick(float DeltaTime)
 	}
 	if (HasAuthority())
 	{
-		SubmitLocalControlIntent(Tank, Intent); // Listen host/standalone submits directly, without an RPC.
+		// Listen Server Host: submit directly
+		Tank->SubmitControlIntent(Intent);
 	}
 	else if (NetworkTankArena::LocalTank::IsValidDeltaTime(DeltaTime))
 	{
-		SecondsUntilInputSend -= DeltaTime;
-		if (SecondsUntilInputSend <= UE_SMALL_NUMBER)
-		{
-			SubmitLocalControlIntent(Tank, Intent);
-			// No catch-up burst after a slow frame. Send full current state even when neutral.
-			SecondsUntilInputSend = InputSendIntervalSeconds;
-		}
+		// Autonomous Client: Predict locally and send move to server
+		const uint32 Sequence = NextMovementIntentSequence++;
+
+		// Client side predict
+		Tank->PredictLocalMove(Sequence, DeltaTime, Intent);
+
+		// Send to server
+		ServerSubmitMove(Tank, Sequence, DeltaTime, NetworkTankArena::LocalTank::SanitizeIntent(Intent));
 	}
 	DispatchPendingFire(Intent);
+
+	if (GEngine && IsLocalController() && !HasAuthority() && IsValid(Tank))
+	{
+		const FString Diag = FString::Printf(
+			TEXT("[PREDICTION DIAGNOSTICS]\n• Sequence: %u\n• Reconciliations: %d\n• Max Pos Error: %.2f cm"),
+			NextMovementIntentSequence,
+			Tank->GetReconciliationCount(),
+			Tank->GetMaxReconciliationError()
+		);
+		GEngine->AddOnScreenDebugMessage(101, 0.f, FColor::Cyan, Diag);
+	}
 }
 
 void ATankPlayerController::Tick(float DeltaSeconds)
@@ -244,6 +266,36 @@ void ATankPlayerController::PostProcessInput(float DeltaTime, bool bGamePaused)
 	bIgnoreFireInputPass = false;
 }
 
+void ATankPlayerController::ServerSubmitMove_Implementation(ATankPawn* TargetTank, uint32 Sequence, float MoveDeltaTime, FTankControlIntent Intent)
+{
+	if (!HasAuthority() || !IsValid(TargetTank) || TargetTank->GetController() != this || GetPawn() != TargetTank)
+	{
+		return;
+	}
+
+	// Validate sequence ordering
+	if (!AcceptedMovementIntentSequence.TryAccept(Sequence))
+	{
+		return;
+	}
+
+	// Sanitize DeltaTime: enforce bounds so lagging/cheating clients cannot simulate huge jumps
+	const float SanitizedDelta = FMath::Clamp(MoveDeltaTime, 0.001f, 0.1f);
+
+	// Execute move authoritatively on the server
+	TargetTank->ExecuteAuthoritativeMove(SanitizedDelta, Intent);
+
+	// Build authoritative acknowledgment
+	FTankServerMoveAck Ack;
+	Ack.AckSequence = Sequence;
+	Ack.Location = TargetTank->GetActorLocation();
+	Ack.Rotation = TargetTank->GetActorRotation();
+	Ack.Velocity = TargetTank->GetVelocity();
+
+	// Send confirmation back to client
+	ClientAckMove(TargetTank, Ack);
+}
+
 void ATankPlayerController::SubmitLocalControlIntent(ATankPawn* Tank, const FTankControlIntent& Intent)
 {
 	if (IsLocalController() && IsValid(Tank) && GetPawn() == Tank && Tank->GetController() == this)
@@ -255,8 +307,26 @@ void ATankPlayerController::SubmitLocalControlIntent(ATankPawn* Tank, const FTan
 		}
 		else
 		{
-			ServerSubmitControlIntent(Tank, Sequence, NetworkTankArena::LocalTank::SanitizeIntent(Intent));
+			// Predict locally with default delta time if called outside frame tick (e.g. from tests or ClearCachedInput)
+			const float Delta = 0.05f;
+			Tank->PredictLocalMove(Sequence, Delta, Intent);
+			ServerSubmitMove(Tank, Sequence, Delta, NetworkTankArena::LocalTank::SanitizeIntent(Intent));
 		}
+	}
+}
+
+void ATankPlayerController::ServerSubmitControlIntent_Implementation(ATankPawn* TargetTank, uint32 Sequence, FTankControlIntent Intent)
+{
+	AcceptControlIntent(TargetTank, Sequence, Intent);
+}
+
+void ATankPlayerController::AcceptControlIntent(ATankPawn* TargetTank, uint32 Sequence, const FTankControlIntent& Intent)
+{
+	if (HasAuthority() && IsValid(TargetTank) && TargetTank->HasAuthority()
+		&& GetPawn() == TargetTank && TargetTank->GetController() == this
+		&& AcceptedMovementIntentSequence.TryAccept(Sequence))
+	{
+		TargetTank->SubmitControlIntent(Intent);
 	}
 }
 
@@ -297,23 +367,6 @@ void ATankPlayerController::AcceptFireRequest(ATankPawn* FiringTank, const FTank
 		|| !AcceptedFireRequestSequence.TryAccept(Request.RequestSequence)) { return; }
 	// A new owner's request is handled once, even when aim/cooldown rejects its shot.
 	FiringTank->GetWeaponComponent()->TryFire(Request.AimWorldPoint);
-}
-
-void ATankPlayerController::ServerSubmitControlIntent_Implementation(ATankPawn* TargetTank, uint32 Sequence, FTankControlIntent Intent)
-{
-	AcceptControlIntent(TargetTank, Sequence, Intent);
-}
-
-void ATankPlayerController::AcceptControlIntent(ATankPawn* TargetTank, uint32 Sequence, const FTankControlIntent& Intent)
-{
-	// The RPC is routed through the owned controller. Never let its caller name another
-	// player's tank, or let an in-flight update for an old pawn affect a new possession.
-	if (HasAuthority() && IsValid(TargetTank) && TargetTank->HasAuthority()
-		&& GetPawn() == TargetTank && TargetTank->GetController() == this
-		&& AcceptedMovementIntentSequence.TryAccept(Sequence))
-	{
-		TargetTank->SubmitControlIntent(Intent); // Pawn sanitizes again at the authority boundary.
-	}
 }
 
 void ATankPlayerController::AcknowledgePossession(APawn* P)
