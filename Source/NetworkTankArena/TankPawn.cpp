@@ -104,6 +104,8 @@ void ATankPawn::BeginPlay()
 	BaseChassisTransform = ChassisVisualPivot->GetRelativeTransform();
 	PredictedTurretWorldYaw = CanonicalTurretWorldYaw;
 	RemoteSmoothedTurretYaw = CanonicalTurretWorldYaw;
+	RemoteSmoothedLocation = GetActorLocation();
+	RemoteSmoothedChassisYaw = GetActorRotation().Yaw;
 	TankMovement->SetUpdatedComponent(CollisionRoot);
 	TankMovement->InitializeGameplayPlane();
 	PreviousPresentationYaw = NormalizeYaw(GetActorRotation().Yaw);
@@ -169,6 +171,7 @@ void ATankPawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetim
 	DOREPLIFETIME(ATankPawn, CanonicalTurretWorldYaw);
 }
 
+
 void ATankPawn::OnRep_CanonicalTurretWorldYaw()
 {
 	// Initial replication can notify before BeginPlay captures Blueprint visual offsets.
@@ -197,7 +200,9 @@ void ATankPawn::Restart()
 void ATankPawn::ApplyPresentation(float DeltaTime)
 {
 	using namespace NetworkTankArena::LocalTank;
-	if (IsValidDeltaTime(DeltaTime))
+	const bool bValidDelta = IsValidDeltaTime(DeltaTime);
+
+	if (bValidDelta)
 	{
 		HoverPhase = FMath::Fmod(HoverPhase + 2.0 * UE_PI * NonNegativeFinite(HoverFrequencyHz) * DeltaTime, 2.0 * UE_PI);
 		const float TurnRate = NonNegativeFinite(TankMovement->GetTurnRateDegreesPerSecond());
@@ -211,17 +216,66 @@ void ATankPawn::ApplyPresentation(float DeltaTime)
 
 		if (!IsLocallyControlled())
 		{
-			RemoteSmoothedTurretYaw = FMath::FInterpTo(RemoteSmoothedTurretYaw, CanonicalTurretWorldYaw, DeltaTime, 15.f);
+			const float DeltaAngle = FMath::FindDeltaAngleDegrees(RemoteSmoothedTurretYaw, CanonicalTurretWorldYaw);
+			RemoteSmoothedTurretYaw = FRotator::NormalizeAxis(FMath::FInterpTo(RemoteSmoothedTurretYaw, RemoteSmoothedTurretYaw + DeltaAngle, DeltaTime, 20.f));
+		}
+	}
+	else
+	{
+		// DeltaTime <= 0.f (called directly from OnRep_CanonicalTurretWorldYaw or BeginPlay):
+		// Immediately snap presentation to the authoritative replicated state
+		if (!IsLocallyControlled())
+		{
+			RemoteSmoothedTurretYaw = CanonicalTurretWorldYaw;
+			RemoteSmoothedLocation = GetActorLocation();
+			RemoteSmoothedChassisYaw = GetActorRotation().Yaw;
 		}
 	}
 
 	const double Bob = FMath::Sin(HoverPhase) * NonNegativeFinite(HoverAmplitude);
-	VisualRoot->SetRelativeLocation(BaseVisualTransform.GetLocation() + FVector(0.0, 0.0, Bob) + VisualCorrectionOffset);
+
+	// Render-time entity interpolation for any tank not controlled on this machine
+	if (!IsLocallyControlled())
+	{
+		// Guard against huge teleports on spawn/respawn
+		if (FVector::DistSquared(RemoteSmoothedLocation, GetActorLocation()) > 40000.f)
+		{
+			RemoteSmoothedLocation = GetActorLocation();
+			RemoteSmoothedChassisYaw = GetActorRotation().Yaw;
+		}
+		else if (bValidDelta)
+		{
+			RemoteSmoothedLocation = FMath::VInterpTo(RemoteSmoothedLocation, GetActorLocation(), DeltaTime, 15.f);
+
+			const float DeltaChassis = FMath::FindDeltaAngleDegrees(RemoteSmoothedChassisYaw, GetActorRotation().Yaw);
+			RemoteSmoothedChassisYaw = FRotator::NormalizeAxis(FMath::FInterpTo(RemoteSmoothedChassisYaw, RemoteSmoothedChassisYaw + DeltaChassis, DeltaTime, 15.f));
+		}
+
+		VisualRoot->SetWorldLocation(RemoteSmoothedLocation + FVector(0.0, 0.0, -65.0 + Bob));
+		VisualRoot->SetWorldRotation(FRotator(0.0, RemoteSmoothedChassisYaw, 0.0));
+	}
+	else
+	{
+		VisualRoot->SetRelativeLocation(BaseVisualTransform.GetLocation() + FVector(0.0, 0.0, Bob) + VisualCorrectionOffset);
+		VisualRoot->SetRelativeRotation(FRotator::ZeroRotator);
+	}
+
 	ChassisVisualPivot->SetRelativeRotation(BaseChassisTransform.Rotator() + FRotator(0.0, 0.0, CurrentBankDegrees));
 
-	const float ActiveTurretYaw = IsLocallyControlled() ? PredictedTurretWorldYaw : RemoteSmoothedTurretYaw;
+	// Turret aim selection
+	float ActiveTurretYaw;
+	if (IsLocallyControlled())
+	{
+		ActiveTurretYaw = HasAuthority() ? CanonicalTurretWorldYaw : PredictedTurretWorldYaw;
+	}
+	else
+	{
+		ActiveTurretYaw = RemoteSmoothedTurretYaw;
+	}
+
+	const float CurrentChassisYaw = !IsLocallyControlled() ? RemoteSmoothedChassisYaw : GetActorRotation().Yaw;
 	TurretYawPivot->SetRelativeRotation(FRotator(0.0,
-		CalculateRelativeTurretYaw(GetActorRotation().Yaw, ActiveTurretYaw), 0.0));
+		CalculateRelativeTurretYaw(CurrentChassisYaw, ActiveTurretYaw), 0.0));
 }
 
 void ATankPawn::UpdateControllerTickPrerequisite()
@@ -308,6 +362,17 @@ void ATankPawn::PredictLocalMove(uint32 Sequence, float DeltaTime, const FTankCo
 	if (SavedMoves.Num() > MaxSavedMovesCapacity)
 	{
 		SavedMoves.RemoveAt(0, SavedMoves.Num() - MaxSavedMovesCapacity);
+	}
+}
+
+void ATankPawn::GetRecentMoves(int32 MaxCount, TArray<FTankMoveRecord>& OutMoves) const
+{
+	OutMoves.Reset();
+	const int32 Count = FMath::Clamp(MaxCount, 1, SavedMoves.Num());
+	const int32 StartIndex = SavedMoves.Num() - Count;
+	for (int32 i = StartIndex; i < SavedMoves.Num(); ++i)
+	{
+		OutMoves.Add(SavedMoves[i]);
 	}
 }
 

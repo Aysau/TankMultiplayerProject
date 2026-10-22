@@ -162,14 +162,17 @@ void ATankPlayerController::PlayerTick(float DeltaTime)
 	}
 	else if (NetworkTankArena::LocalTank::IsValidDeltaTime(DeltaTime))
 	{
-		// Autonomous Client: Predict locally and send move to server
+		// Autonomous Client: Predict locally and send redundant moves to server
 		const uint32 Sequence = NextMovementIntentSequence++;
 
 		// Client side predict
 		Tank->PredictLocalMove(Sequence, DeltaTime, Intent);
 
-		// Send to server
-		ServerSubmitMove(Tank, Sequence, DeltaTime, NetworkTankArena::LocalTank::SanitizeIntent(Intent));
+		// Gather redundant window 
+		TArray<FTankMoveRecord> RedundantMoves;
+		Tank->GetRecentMoves(6, RedundantMoves);
+
+		ServerSubmitMoves(Tank, RedundantMoves);
 	}
 	DispatchPendingFire(Intent);
 
@@ -266,34 +269,32 @@ void ATankPlayerController::PostProcessInput(float DeltaTime, bool bGamePaused)
 	bIgnoreFireInputPass = false;
 }
 
-void ATankPlayerController::ServerSubmitMove_Implementation(ATankPawn* TargetTank, uint32 Sequence, float MoveDeltaTime, FTankControlIntent Intent)
+void ATankPlayerController::ServerSubmitMoves_Implementation(ATankPawn* TargetTank, const TArray<FTankMoveRecord>& Moves)
 {
-	if (!HasAuthority() || !IsValid(TargetTank) || TargetTank->GetController() != this || GetPawn() != TargetTank)
+	if (!HasAuthority() || !IsValid(TargetTank) || TargetTank->GetController() != this || GetPawn() != TargetTank || Moves.IsEmpty())
 	{
 		return;
 	}
 
-	// Validate sequence ordering
-	if (!AcceptedMovementIntentSequence.TryAccept(Sequence))
+	for (const FTankMoveRecord& Move : Moves)
 	{
-		return;
+		if (AcceptedMovementIntentSequence.TryAccept(Move.Sequence))
+		{
+			const float SanitizedDelta = FMath::Clamp(Move.DeltaTime, 0.001f, 0.1f);
+			TargetTank->ExecuteAuthoritativeMove(SanitizedDelta, Move.Intent);
+		}
 	}
 
-	// Sanitize DeltaTime: enforce bounds so lagging/cheating clients cannot simulate huge jumps
-	const float SanitizedDelta = FMath::Clamp(MoveDeltaTime, 0.001f, 0.1f);
+	if (AcceptedMovementIntentSequence.bHasAcceptedSequence)
+	{
+		FTankServerMoveAck Ack;
+		Ack.AckSequence = AcceptedMovementIntentSequence.LastAcceptedSequence;
+		Ack.Location = TargetTank->GetActorLocation();
+		Ack.Rotation = TargetTank->GetActorRotation();
+		Ack.Velocity = TargetTank->GetVelocity();
 
-	// Execute move authoritatively on the server
-	TargetTank->ExecuteAuthoritativeMove(SanitizedDelta, Intent);
-
-	// Build authoritative acknowledgment
-	FTankServerMoveAck Ack;
-	Ack.AckSequence = Sequence;
-	Ack.Location = TargetTank->GetActorLocation();
-	Ack.Rotation = TargetTank->GetActorRotation();
-	Ack.Velocity = TargetTank->GetVelocity();
-
-	// Send confirmation back to client
-	ClientAckMove(TargetTank, Ack);
+		ClientAckMove(TargetTank, Ack);
+	}
 }
 
 void ATankPlayerController::SubmitLocalControlIntent(ATankPawn* Tank, const FTankControlIntent& Intent)
@@ -307,10 +308,11 @@ void ATankPlayerController::SubmitLocalControlIntent(ATankPawn* Tank, const FTan
 		}
 		else
 		{
-			// Predict locally with default delta time if called outside frame tick (e.g. from tests or ClearCachedInput)
 			const float Delta = 0.05f;
 			Tank->PredictLocalMove(Sequence, Delta, Intent);
-			ServerSubmitMove(Tank, Sequence, Delta, NetworkTankArena::LocalTank::SanitizeIntent(Intent));
+			TArray<FTankMoveRecord> Moves;
+			Tank->GetRecentMoves(3, Moves);
+			ServerSubmitMoves(Tank, Moves);
 		}
 	}
 }

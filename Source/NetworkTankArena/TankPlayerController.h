@@ -53,7 +53,7 @@ private:
 	friend class FTankNetworkFireLifecycleTest;
 
 	UFUNCTION(Server, Unreliable)
-	void ServerSubmitMove(ATankPawn* TargetTank, uint32 Sequence, float DeltaTime, FTankControlIntent Intent);
+	void ServerSubmitMoves(ATankPawn* TargetTank, const TArray<FTankMoveRecord>& Moves);
 	void SubmitLocalControlIntent(ATankPawn* Tank, const FTankControlIntent& Intent);
 	void ServerSubmitControlIntent_Implementation(ATankPawn* TargetTank, uint32 Sequence, FTankControlIntent Intent);
 	void AcceptControlIntent(ATankPawn* TargetTank, uint32 Sequence, const FTankControlIntent& Intent);

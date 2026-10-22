@@ -39,6 +39,8 @@ public:
 	// Receives authoritative confirmation from the server and reconciles if necessary
 	void ReconcileServerMove(const FTankServerMoveAck& Ack);
 
+	void GetRecentMoves(int32 MaxCount, TArray<FTankMoveRecord>& OutMoves) const;
+
 	// Profiling
 	int32 GetReconciliationCount() const { return ReconciliationCount; }
 	float GetMaxReconciliationError() const { return MaxReconciliationError; }
@@ -112,6 +114,9 @@ private:
 	float PreviousPresentationYaw = 0.f;
 	float PredictedTurretWorldYaw = 0.f;
 	TWeakObjectPtr<AController> TickController;
+
+	FVector RemoteSmoothedLocation = FVector::ZeroVector;
+	float RemoteSmoothedChassisYaw = 0.f;
 
 	// Visual reconciliation smoothing offset
 	FVector VisualCorrectionOffset = FVector::ZeroVector;
